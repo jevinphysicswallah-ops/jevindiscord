@@ -1,7 +1,45 @@
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
 
-const BASE_URL = 'http://127.0.0.1:3000';
+const TEST_PORT = Number(process.env.TEST_PORT || 3210);
+const BASE_URL = `http://127.0.0.1:${TEST_PORT}`;
+const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nexus-test-'));
+let serverProcess = null;
+
+function startTestServer() {
+  return new Promise((resolve, reject) => {
+    serverProcess = spawn(process.execPath, ['server.cjs'], {
+      cwd: __dirname,
+      env: {
+        ...process.env,
+        PORT: String(TEST_PORT),
+        NEXUS_DATA_DIR: TEST_DATA_DIR,
+        ALLOW_INSECURE_DEV_AUTH: '1'
+      },
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    const timeout = setTimeout(() => reject(new Error('Test server did not start in time.')), 8000);
+    serverProcess.stdout.on('data', chunk => {
+      if (String(chunk).includes('SERVER IS LIVE')) {
+        clearTimeout(timeout);
+        resolve();
+      }
+    });
+    serverProcess.stderr.on('data', chunk => process.stderr.write(chunk));
+    serverProcess.on('exit', code => {
+      if (code && code !== 0) reject(new Error(`Test server exited with code ${code}.`));
+    });
+  });
+}
+
+function cleanup() {
+  if (serverProcess && !serverProcess.killed) serverProcess.kill('SIGTERM');
+  fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true });
+}
 
 function apiRequest(pathname, method = 'GET', body = null, token = null) {
   return new Promise((resolve, reject) => {
@@ -47,8 +85,8 @@ class SimpleWsClient {
       const key = crypto.randomBytes(16).toString('base64');
       const req = http.request({
         hostname: '127.0.0.1',
-        port: 3000,
-        path: `/?token=${this.token}`,
+        port: TEST_PORT,
+        path: '/ws',
         headers: {
           'Connection': 'Upgrade',
           'Upgrade': 'websocket',
@@ -170,31 +208,31 @@ async function runTests() {
     console.log('1. Authenticating real user accounts:');
     const hostAuth = await apiRequest('/api/auth/google', 'POST', {
       email: 'pg.74849@gmail.com',
-      name: 'tejash patel',
+      displayName: 'tejash patel',
       avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=pg74849',
-      id: 'google_pg74849'
+      googleId: 'google_pg74849'
     });
     console.log(`   ✅ Host Logged In: ${hostAuth.user.displayName} (${hostAuth.user.email})`);
 
     const friendAuth = await apiRequest('/api/auth/google', 'POST', {
       email: 'jevinphysicswallah@gmail.com',
-      name: 'Jevin Patel',
+      displayName: 'Jevin Patel',
       avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=jevinphysicswal',
-      id: 'google_jevinphysicswal'
+      googleId: 'google_jevinphysicswal'
     });
     console.log(`   ✅ Friend Logged In: ${friendAuth.user.displayName} (${friendAuth.user.email})`);
 
     const dadAuth = await apiRequest('/api/auth/google', 'POST', {
       email: 'npmithaiwala06@gmail.com',
-      name: 'Dad (N.P. Patel)',
+      displayName: 'Dad (N.P. Patel)',
       avatar: 'https://api.dicebear.com/7.x/bottts/svg?seed=npmithaiwala06',
-      id: 'google_npmithaiwala06'
+      googleId: 'google_npmithaiwala06'
     });
     console.log(`   ✅ Dad Logged In: ${dadAuth.user.displayName} (${dadAuth.user.email})`);
 
     // 2. Fetch Shared Music Rooms
     console.log('\n2. Verifying Shared Synchronized Music Rooms:');
-    const musicData = await apiRequest('/api/music/rooms', 'GET');
+    const musicData = await apiRequest('/api/music/rooms', 'GET', null, hostAuth.token);
     if (!musicData.rooms || musicData.rooms.length === 0) {
       throw new Error('No music rooms returned');
     }
@@ -207,6 +245,22 @@ async function runTests() {
     const friendWs = await new SimpleWsClient(friendAuth.token, 'Friend').connect();
     const dadWs = await new SimpleWsClient(dadAuth.token, 'Dad').connect();
     console.log('   ✅ Host, Friend, and Dad WebSockets Connected!');
+
+    // Verify private space traffic stays private to its members.
+    const privateSpace = await apiRequest('/api/servers', 'POST', { name: 'Host Private Space', color: '#7c5cff' }, hostAuth.token);
+    const privateTextChannel = privateSpace.server.channels.find(channel => channel.type === 'text');
+    const privateVoiceChannel = privateSpace.server.channels.find(channel => channel.type === 'voice');
+    hostWs.send({ event: 'send_message', payload: { channelId: privateTextChannel.id, text: 'members only' } });
+    friendWs.send({ event: 'voice_state', payload: { channelId: privateVoiceChannel.id, isMuted: false } });
+    await new Promise(r => setTimeout(r, 400));
+    if (friendWs.events.some(e => e.event === 'new_message' && e.payload?.channelId === privateTextChannel.id)) {
+      throw new Error('Private channel message leaked to a non-member.');
+    }
+    const privateVoiceState = await apiRequest(`/api/voice/${privateVoiceChannel.id}`, 'GET', null, hostAuth.token);
+    if (privateVoiceState.participants.some(participant => participant.userId === friendAuth.user.id)) {
+      throw new Error('A non-member joined a private voice channel.');
+    }
+    console.log('   ✅ Private text and voice channels reject non-member access!');
 
     // 4. Test Song Editing & Full Access
     console.log('\n4. Testing Song Editing ("You can edit all the songs"):');
@@ -241,8 +295,15 @@ async function runTests() {
     console.log(`   ✅ Edit Song Synced across all devices! Title: "${newTitle}"`);
 
     // 5. Test Full Spotify Access & Synchronized Embed
-    console.log('\n5. Testing Spotify Sync ("Our music will be the same on our device and my device"):');
+    console.log('\n5. Testing synchronized Spotify room selection:');
     const spotifyEmbedUrl = 'https://open.spotify.com/embed/track/0VjIjW4GlUZAMYd2vXMi3b?utm_source=generator&theme=0';
+
+    dadWs.send({ event: 'music_action', payload: { roomId: musicRoom.id, action: 'set_spotify_embed', data: { spotifyEmbed: 'https://example.com/fake-player' } } });
+    await new Promise(r => setTimeout(r, 250));
+    const afterRejectedEmbed = await apiRequest('/api/music/rooms', 'GET', null, hostAuth.token);
+    if (afterRejectedEmbed.rooms[0].spotifyEmbed === 'https://example.com/fake-player') {
+      throw new Error('Non-Spotify iframe URL was accepted.');
+    }
     
     // Dad embeds a Spotify song
     dadWs.send({
@@ -269,11 +330,11 @@ async function runTests() {
     if (!hostReceivedSpotify || !friendReceivedSpotify) {
       throw new Error('Host or Friend failed to receive synchronized Spotify embed!');
     }
-    console.log('   ✅ Spotify Embed broadcasted & matched identically across all devices!');
+    console.log('   ✅ Official Spotify embed selection matched across all devices!');
 
     // 6. Test Voice Lounge Full Mesh WebRTC Voice Calling for Dad, Friend, and Host
     console.log('\n6. Testing Voice Lounge Multi-User Voice Mesh ("Dad can hear me and my friend also when we join the voice lounge"):');
-    const channelId = 'ch-lounge-default';
+    const channelId = 'nexus-main-lounge';
 
     // All 3 join the voice lounge
     hostWs.send({ event: 'voice_state', payload: { channelId, isSpeaking: false, isMuted: false } });
@@ -310,11 +371,11 @@ async function runTests() {
     const dummySdpOffer = { type: 'offer', sdp: 'v=0\r\no=host 1234 1234 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n' };
     hostWs.send({
       event: 'webrtc_signal',
-      payload: { targetUserId: dadAuth.user.id, signal: dummySdpOffer }
+      payload: { targetUserId: dadAuth.user.id, signal: { channelId, description: dummySdpOffer } }
     });
     await new Promise(r => setTimeout(r, 400));
 
-    const dadReceivedSdp = dadWs.events.find(e => e.event === 'webrtc_signal' && e.payload?.fromUserId === hostAuth.user.id && e.payload?.signal?.type === 'offer');
+    const dadReceivedSdp = dadWs.events.find(e => e.event === 'webrtc_signal' && e.payload?.fromUserId === hostAuth.user.id && e.payload?.signal?.description?.type === 'offer');
     if (!dadReceivedSdp) {
       throw new Error('Dad failed to receive Host WebRTC SDP Offer!');
     }
@@ -328,12 +389,22 @@ async function runTests() {
     console.log('\n========================================================');
     console.log('🎉 ALL AUTOMATED TESTS PASSED WITH 100% SUCCESS!');
     console.log('========================================================');
-    process.exit(0);
+    return true;
 
   } catch (err) {
     console.error('\n❌ TEST FAILED:', err.message);
-    process.exit(1);
+    return false;
   }
 }
 
-runTests();
+startTestServer()
+  .then(runTests)
+  .then(ok => {
+    cleanup();
+    process.exitCode = ok ? 0 : 1;
+  })
+  .catch(error => {
+    console.error('\n❌ TEST SETUP FAILED:', error.message);
+    cleanup();
+    process.exitCode = 1;
+  });

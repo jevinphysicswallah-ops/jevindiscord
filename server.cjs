@@ -5,9 +5,13 @@ const crypto = require('crypto');
 const os = require('os');
 
 const PORT = process.env.PORT || 3000;
-const PUBLIC_DIR = __dirname;
-const DATA_DIR = path.join(__dirname, 'data');
+const DIST_DIR = path.join(__dirname, 'dist');
+const PUBLIC_DIR = fs.existsSync(path.join(DIST_DIR, 'index.html')) ? DIST_DIR : __dirname;
+const DATA_DIR = process.env.NEXUS_DATA_DIR ? path.resolve(process.env.NEXUS_DATA_DIR) : path.join(__dirname, 'data');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
+const PASSWORD_ITERATIONS = 210000;
+const MAX_WS_PAYLOAD = 64 * 1024;
+const ALLOW_INSECURE_DEV_AUTH = process.env.ALLOW_INSECURE_DEV_AUTH === '1';
 
 // Ensure data directory exists
 if (!fs.existsSync(DATA_DIR)) {
@@ -101,14 +105,26 @@ function saveDbSync() {
 }
 
 // Cryptography Helpers
-function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
-  const hash = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
-  return { hash, salt };
+function derivePassword(password, salt, iterations) {
+  return new Promise((resolve, reject) => {
+    crypto.pbkdf2(password, salt, iterations, 64, 'sha512', (error, key) => {
+      if (error) reject(error);
+      else resolve(key);
+    });
+  });
 }
 
-function verifyPassword(password, hash, salt) {
-  const verify = crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
-  return hash === verify;
+async function hashPassword(password, salt = crypto.randomBytes(16).toString('hex'), iterations = PASSWORD_ITERATIONS) {
+  const hash = (await derivePassword(password, salt, iterations)).toString('hex');
+  return { hash, salt, iterations };
+}
+
+async function verifyPassword(password, user) {
+  if (!user || !user.passwordHash || !user.salt) return false;
+  const iterations = user.passwordIterations || 10000;
+  const verify = await derivePassword(password, user.salt, iterations);
+  const expected = Buffer.from(user.passwordHash, 'hex');
+  return expected.length === verify.length && crypto.timingSafeEqual(expected, verify);
 }
 
 function generateToken() {
@@ -116,7 +132,7 @@ function generateToken() {
 }
 
 // Authentication Middleware
-function getAuthUser(req) {
+function getRequestToken(req) {
   const authHeader = req.headers['authorization'];
   let token = null;
   if (authHeader && authHeader.startsWith('Bearer ')) {
@@ -129,6 +145,11 @@ function getAuthUser(req) {
     }
   }
 
+  return token;
+}
+
+function getAuthUser(req) {
+  const token = getRequestToken(req);
   if (!token) return null;
   const session = db.sessions.find(s => s.token === token && s.expiresAt > Date.now());
   if (!session) return null;
@@ -140,11 +161,44 @@ function getAuthUser(req) {
 
 // Connected WebSocket Clients
 const wsClients = new Set(); // Set of { socket, user }
+const requestBuckets = new Map();
+
+function rateLimitExceeded(req, bucket, limit, windowMs = 15 * 60 * 1000) {
+  const key = `${req.socket.remoteAddress || 'unknown'}:${bucket}`;
+  const now = Date.now();
+  const current = requestBuckets.get(key);
+  if (!current || current.resetAt <= now) {
+    requestBuckets.set(key, { count: 1, resetAt: now + windowMs });
+    return false;
+  }
+  current.count += 1;
+  return current.count > limit;
+}
 
 function broadcast(event, payload, excludeSocket = null) {
   const msg = JSON.stringify({ event, payload });
   for (const client of wsClients) {
-    if (client.socket !== excludeSocket && client.socket.writable) {
+    if (client.user && client.socket !== excludeSocket && client.socket.writable) {
+      sendWsFrame(client.socket, msg);
+    }
+  }
+}
+
+function broadcastToChannelMembers(channelId, event, payload) {
+  const msg = JSON.stringify({ event, payload });
+  for (const client of wsClients) {
+    if (client.user && client.socket.writable && userCanAccessChannel(client.user.id, channelId)) {
+      sendWsFrame(client.socket, msg);
+    }
+  }
+}
+
+function broadcastToVoiceChannel(channelId, event, payload) {
+  const participants = db.voiceParticipants[channelId] || [];
+  const memberIds = new Set(participants.map(participant => participant.userId));
+  const msg = JSON.stringify({ event, payload });
+  for (const client of wsClients) {
+    if (client.user && client.socket.writable && memberIds.has(client.user.id)) {
       sendWsFrame(client.socket, msg);
     }
   }
@@ -159,12 +213,97 @@ function sendToUser(userId, event, payload) {
   }
 }
 
+function gameRoomForUser(room, userId) {
+  const safeRoom = JSON.parse(JSON.stringify(room));
+  const state = safeRoom.gameState;
+  if (!state || safeRoom.status !== 'playing') return safeRoom;
+  if (safeRoom.gameType === 'rps') {
+    const ownChoice = state.choices?.[userId];
+    state.choicesSubmitted = Object.keys(state.choices || {});
+    state.choices = ownChoice ? { [userId]: ownChoice } : {};
+  }
+  if (safeRoom.gameType === 'guess') delete state.target;
+  if (safeRoom.gameType === 'trivia') {
+    state.questions = (state.questions || []).map(({ answer, ...question }) => question);
+    const ownAnswer = state.answers?.[userId];
+    state.answers = ownAnswer === undefined ? {} : { [userId]: ownAnswer };
+  }
+  return safeRoom;
+}
+
+function broadcastGameRoom(event, room) {
+  for (const client of wsClients) {
+    if (!client.socket.writable || !client.user) continue;
+    sendWsFrame(client.socket, JSON.stringify({ event, payload: gameRoomForUser(room, client.user.id) }));
+  }
+}
+
+function findChannel(channelId) {
+  for (const server of db.servers) {
+    const channel = server.channels.find(candidate => candidate.id === channelId);
+    if (channel) return { server, channel };
+  }
+  return null;
+}
+
+function userCanAccessChannel(userId, channelId) {
+  const match = findChannel(channelId);
+  return !!match && match.server.members.some(member => member.userId === userId);
+}
+
+function userCanJoinVoiceChannel(userId, channelId) {
+  if (channelId === 'nexus-main-lounge') return true;
+  const match = findChannel(channelId);
+  return !!match && match.channel.type !== 'text' &&
+    match.server.members.some(member => member.userId === userId);
+}
+
+function usersShareVoiceChannel(firstUserId, secondUserId, channelId) {
+  const participants = db.voiceParticipants[channelId] || [];
+  return participants.some(participant => participant.userId === firstUserId) &&
+    participants.some(participant => participant.userId === secondUserId);
+}
+
+function spotifyEmbedIsAllowed(value) {
+  if (value === null || value === undefined || value === '') return true;
+  try {
+    const url = new URL(String(value));
+    return url.protocol === 'https:' && url.hostname === 'open.spotify.com' && url.pathname.startsWith('/embed/');
+  } catch {
+    return false;
+  }
+}
+
 // Native RFC 6455 WebSocket Implementation
 function handleWsUpgrade(req, socket, head) {
-  const key = req.headers['sec-websocket-key'];
-  if (!key) {
+  const requestUrl = new URL(req.url, 'http://localhost');
+  if (requestUrl.pathname !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
     socket.destroy();
     return;
+  }
+  const key = req.headers['sec-websocket-key'];
+  const version = req.headers['sec-websocket-version'];
+  if (!key || version !== '13') {
+    socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  const origin = req.headers.origin;
+  if (origin) {
+    try {
+      const originUrl = new URL(origin);
+      const requestHost = String(req.headers.host || '').split(':')[0];
+      const bothLocal = ['localhost', '127.0.0.1'].includes(originUrl.hostname) && ['localhost', '127.0.0.1'].includes(requestHost);
+      if (originUrl.host !== req.headers.host && !bothLocal) {
+        socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+    } catch {
+      socket.destroy();
+      return;
+    }
   }
 
   const accept = crypto
@@ -182,19 +321,11 @@ function handleWsUpgrade(req, socket, head) {
   socket.write(headers.join('\r\n') + '\r\n\r\n');
 
   // Authenticate from query param or header
-  const urlObj = new URL(req.url, 'http://localhost');
-  const token = urlObj.searchParams.get('token');
-  let user = null;
-  if (token) {
-    const session = db.sessions.find(s => s.token === token && s.expiresAt > Date.now());
-    if (session) {
-      user = db.users.find(u => u.id === session.userId) || null;
-    }
-  }
-
+  const token = getRequestToken(req);
+  const session = token ? db.sessions.find(candidate => candidate.token === token && candidate.expiresAt > Date.now()) : null;
+  const user = session ? db.users.find(candidate => candidate.id === session.userId) || null : null;
   const client = { socket, user };
   wsClients.add(client);
-
   if (user) {
     user.status = 'online';
     saveDbSync();
@@ -208,6 +339,7 @@ function handleWsUpgrade(req, socket, head) {
     while (buffer.length >= 2) {
       const firstByte = buffer[0];
       const secondByte = buffer[1];
+      const isFinal = (firstByte & 0x80) !== 0;
       const opcode = firstByte & 0x0f;
       const isMasked = (secondByte & 0x80) !== 0;
       let payloadLength = secondByte & 0x7f;
@@ -219,8 +351,18 @@ function handleWsUpgrade(req, socket, head) {
         offset = 4;
       } else if (payloadLength === 127) {
         if (buffer.length < 10) break;
-        payloadLength = Number(buffer.readBigUInt64BE(2));
+        const wideLength = buffer.readBigUInt64BE(2);
+        if (wideLength > BigInt(MAX_WS_PAYLOAD)) {
+          socket.destroy();
+          return;
+        }
+        payloadLength = Number(wideLength);
         offset = 10;
+      }
+
+      if (!isMasked || !isFinal || payloadLength > MAX_WS_PAYLOAD) {
+        socket.destroy();
+        return;
       }
 
       let maskKey = null;
@@ -287,7 +429,7 @@ function handleWsUpgrade(req, socket, head) {
       // Remove from any voice channels
       for (const chId in db.voiceParticipants) {
         db.voiceParticipants[chId] = db.voiceParticipants[chId].filter(p => p.userId !== client.user.id);
-        broadcast('voice_update', { channelId: chId, participants: db.voiceParticipants[chId] });
+        broadcastToVoiceChannel(chId, 'voice_update', { channelId: chId, participants: db.voiceParticipants[chId] });
       }
 
       // Clean up or forfeit active game rooms
@@ -302,7 +444,7 @@ function handleWsUpgrade(req, socket, head) {
               room.winner = room.players[0].userId;
             }
           }
-          broadcast('game_room_update', room);
+          broadcastGameRoom('game_room_update', room);
         }
       }
       saveDbSync();
@@ -376,6 +518,11 @@ function handleWsMessage(client, data) {
     // Real-time Chat
     if (event === 'send_message') {
       if (!payload.text || !payload.channelId) return;
+      const text = String(payload.text).trim().slice(0, 2000);
+      if (!text || !userCanAccessChannel(client.user.id, payload.channelId)) {
+        sendWsFrame(client.socket, JSON.stringify({ event: 'error', payload: 'You cannot post in that channel.' }));
+        return;
+      }
       const msg = {
         id: 'msg-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
         channelId: payload.channelId,
@@ -384,12 +531,12 @@ function handleWsMessage(client, data) {
         authorName: client.user.displayName,
         authorUsername: client.user.username,
         authorAvatar: client.user.avatar,
-        text: payload.text.trim(),
+        text,
         timestamp: new Date().toISOString()
       };
       db.messages.push(msg);
       saveDbSync();
-      broadcast('new_message', msg);
+      broadcastToChannelMembers(msg.channelId, 'new_message', msg);
       return;
     }
 
@@ -414,7 +561,9 @@ function handleWsMessage(client, data) {
 
     // Real-time WebRTC Signaling (Voice & Video Call)
     if (event === 'webrtc_signal') {
-      if (!payload.targetUserId) return;
+      const channelId = payload.signal?.channelId;
+      if (!payload.targetUserId || !channelId) return;
+      if (!usersShareVoiceChannel(client.user.id, payload.targetUserId, channelId)) return;
       sendToUser(payload.targetUserId, 'webrtc_signal', {
         fromUserId: client.user.id,
         fromUsername: client.user.username,
@@ -444,11 +593,10 @@ function handleWsMessage(client, data) {
     if (event === 'voice_speaking') {
       const { channelId, isSpeaking } = payload;
       if (!channelId) return;
-      if (db.voiceParticipants[channelId]) {
-        const part = db.voiceParticipants[channelId].find(p => p.userId === client.user.id);
-        if (part) part.isSpeaking = !!isSpeaking;
-      }
-      broadcast('voice_speaking', {
+      const part = db.voiceParticipants[channelId]?.find(p => p.userId === client.user.id);
+      if (!part) return;
+      part.isSpeaking = !!isSpeaking;
+      broadcastToVoiceChannel(channelId, 'voice_speaking', {
         channelId,
         userId: client.user.id,
         isSpeaking: !!isSpeaking
@@ -460,6 +608,7 @@ function handleWsMessage(client, data) {
     if (event === 'voice_state') {
       const { channelId, isMuted, isDeafened, isCameraOn, isScreenSharing, isSpeaking } = payload;
       if (!channelId) return;
+      if (!userCanJoinVoiceChannel(client.user.id, channelId)) return;
       if (!db.voiceParticipants[channelId]) db.voiceParticipants[channelId] = [];
       
       let part = db.voiceParticipants[channelId].find(p => p.userId === client.user.id);
@@ -485,7 +634,7 @@ function handleWsMessage(client, data) {
         if (isSpeaking !== undefined) part.isSpeaking = isSpeaking;
       }
       saveDbSync();
-      broadcast('voice_update', { channelId, participants: db.voiceParticipants[channelId] });
+      broadcastToVoiceChannel(channelId, 'voice_update', { channelId, participants: db.voiceParticipants[channelId] });
       return;
     }
 
@@ -495,7 +644,7 @@ function handleWsMessage(client, data) {
       if (channelId && db.voiceParticipants[channelId]) {
         db.voiceParticipants[channelId] = db.voiceParticipants[channelId].filter(p => p.userId !== client.user.id);
         saveDbSync();
-        broadcast('voice_update', { channelId, participants: db.voiceParticipants[channelId] });
+        broadcastToVoiceChannel(channelId, 'voice_update', { channelId, participants: db.voiceParticipants[channelId] });
       }
       return;
     }
@@ -520,11 +669,8 @@ function handleWsMessage(client, data) {
 function handleMusicAction(user, payload) {
   if (!payload || !payload.roomId) return;
   const { roomId, action, data = {} } = payload;
-  let room = db.musicRooms.find(r => r.id === roomId);
-  if (!room) {
-    if (db.musicRooms.length > 0) room = db.musicRooms[0];
-    else return;
-  }
+  const room = db.musicRooms.find(r => r.id === roomId);
+  if (!room) return;
 
   const now = Date.now();
 
@@ -560,15 +706,17 @@ function handleMusicAction(user, payload) {
     room.startedAt = now;
     room.pauseOffset = 0;
   } else if (action === 'select_track') {
-    if (data.index !== undefined && data.index >= 0 && data.index < room.queue.length) {
+    if (Number.isInteger(data.index) && data.index >= 0 && data.index < room.queue.length) {
       room.currentTrackIndex = data.index;
       room.isPlaying = true;
       room.startedAt = now;
       room.pauseOffset = 0;
     }
   } else if (action === 'seek') {
-    if (data.seconds !== undefined) {
-      room.pauseOffset = data.seconds * 1000;
+    const duration = room.queue[room.currentTrackIndex]?.duration || 180;
+    const seconds = Number(data.seconds);
+    if (Number.isFinite(seconds)) {
+      room.pauseOffset = Math.max(0, Math.min(duration, seconds)) * 1000;
       room.startedAt = now - room.pauseOffset;
     }
   } else if (action === 'edit_track') {
@@ -605,6 +753,7 @@ function handleMusicAction(user, payload) {
       }
     }
   } else if (action === 'set_spotify_embed') {
+    if (!spotifyEmbedIsAllowed(data.spotifyEmbed)) return;
     room.spotifyEmbed = data.spotifyEmbed || null;
     if (data.track) {
       const existing = room.queue.find(t => t.spotifyUrl && t.spotifyUrl === data.track.spotifyUrl);
@@ -670,7 +819,7 @@ function handleGameAction(user, payload) {
       }
     }
     saveDbSync();
-    broadcast('game_room_update', room);
+    broadcastGameRoom('game_room_update', room);
     return;
   }
 
@@ -691,7 +840,7 @@ function handleGameAction(user, payload) {
   }
 
   saveDbSync();
-  broadcast('game_room_update', room);
+  broadcastGameRoom('game_room_update', room);
 }
 
 function initializeGameState(room) {
@@ -824,6 +973,8 @@ function processGameMove(room, userId, data) {
   // Rock Paper Scissors
   else if (room.gameType === 'rps') {
     const { choice } = data;
+    if (!['rock', 'paper', 'scissors'].includes(choice)) return;
+    if (room.gameState.choices[userId] !== undefined) return;
     room.gameState.choices[userId] = choice;
 
     if (Object.keys(room.gameState.choices).length === 2) {
@@ -849,10 +1000,10 @@ function processGameMove(room, userId, data) {
       }
       room.gameState.roundWinner = roundWin;
 
-      if (room.gameState.scores[p1] >= 3) {
+      if (room.gameState.scores[p1] >= 2) {
         room.status = 'finished';
         room.winner = p1;
-      } else if (room.gameState.scores[p2] >= 3) {
+      } else if (room.gameState.scores[p2] >= 2) {
         room.status = 'finished';
         room.winner = p2;
       } else {
@@ -889,8 +1040,10 @@ function processGameMove(room, userId, data) {
 
   // Number Guessing
   else if (room.gameType === 'guess') {
+    if (room.currentTurn !== userId) return;
     const { guess } = data;
     const num = parseInt(guess, 10);
+    if (!Number.isInteger(num) || num < 1 || num > 100) return;
     const target = room.gameState.target;
     let hint = 'Correct!';
     if (num < target) hint = 'Higher';
@@ -918,6 +1071,7 @@ function processGameMove(room, userId, data) {
     const { answerIndex } = data;
     const currentQ = room.gameState.questions[room.gameState.questionIndex];
     if (!currentQ) return;
+    if (!Number.isInteger(answerIndex) || answerIndex < 0 || answerIndex >= currentQ.options.length) return;
     if (!room.gameState.answers) room.gameState.answers = {};
     if (room.gameState.answers[userId] !== undefined) return; // Already answered
 
@@ -985,12 +1139,26 @@ function sanitizeUser(u) {
   };
 }
 
+function sanitizePublicUser(u) {
+  const user = sanitizeUser(u);
+  delete user.email;
+  return user;
+}
+
 // HTTP Request Handler
 const server = http.createServer((req, res) => {
-  // CORS & Security Headers
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  // Same-origin by default; an explicit CORS_ORIGIN may be set for a separate trusted client.
+  if (process.env.CORS_ORIGIN) {
+    res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  }
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'same-origin');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Permissions-Policy', 'camera=(self), microphone=(self), display-capture=(self), geolocation=()');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com 'unsafe-inline'; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: https:; connect-src 'self' ws: wss:; frame-src https://open.spotify.com; media-src 'self' blob:");
 
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -1004,14 +1172,23 @@ const server = http.createServer((req, res) => {
   // JSON Body Parser Helper
   function parseJsonBody(cb) {
     let body = '';
+    let tooLarge = false;
     req.on('data', chunk => {
+      if (tooLarge) return;
       body += chunk;
-      if (body.length > 2e6) req.destroy(); // 2MB limit
+      if (body.length > 256 * 1024) {
+        tooLarge = true;
+        sendJson(413, { error: 'Request body is too large.' });
+      }
     });
     req.on('end', () => {
+      if (tooLarge) return;
       try {
         const data = body ? JSON.parse(body) : {};
-        cb(null, data);
+        Promise.resolve(cb(null, data)).catch(error => {
+          console.error('Request handler failed:', error.message);
+          if (!res.headersSent) sendJson(500, { error: 'Server error' });
+        });
       } catch (err) {
         cb(err);
       }
@@ -1023,13 +1200,20 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify(data));
   }
 
+  function setSessionCookie(token, maxAgeSeconds = 30 * 24 * 60 * 60) {
+    const forwardedProto = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim();
+    const secure = forwardedProto === 'https' || !!req.socket.encrypted;
+    res.setHeader('Set-Cookie', `session_token=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAgeSeconds}${secure ? '; Secure' : ''}`);
+  }
+
   // ========================================================
   // REST API ENDPOINTS
   // ========================================================
 
   // 1. AUTH: REGISTER
   if (req.method === 'POST' && pathname === '/api/auth/register') {
-    parseJsonBody((err, body) => {
+    if (rateLimitExceeded(req, 'register', 8)) return sendJson(429, { error: 'Too many registration attempts. Try again later.' });
+    parseJsonBody(async (err, body) => {
       if (err) return sendJson(400, { error: 'Invalid JSON' });
       const { displayName, username, email, password } = body;
 
@@ -1040,13 +1224,20 @@ const server = http.createServer((req, res) => {
       const cleanUsername = username.trim().toLowerCase();
       const cleanEmail = email.trim().toLowerCase();
 
+      if (!/^[a-z0-9_]{3,24}$/.test(cleanUsername)) {
+        return sendJson(400, { error: 'Username must be 3–24 letters, numbers, or underscores.' });
+      }
+      if (displayName.trim().length < 1 || displayName.trim().length > 40) {
+        return sendJson(400, { error: 'Display name must be 1–40 characters.' });
+      }
+
       // Email format check
       if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
         return sendJson(400, { error: 'Please enter a valid email address.' });
       }
 
-      if (password.length < 6) {
-        return sendJson(400, { error: 'Password must be at least 6 characters.' });
+      if (password.length < 8 || password.length > 128) {
+        return sendJson(400, { error: 'Password must be 8–128 characters.' });
       }
 
       // Check unique username & email
@@ -1057,7 +1248,7 @@ const server = http.createServer((req, res) => {
         return sendJson(409, { error: 'Email is already registered.' });
       }
 
-      const { hash, salt } = hashPassword(password);
+      const { hash, salt, iterations } = await hashPassword(password);
       const newUser = {
         id: 'usr-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
         displayName: displayName.trim(),
@@ -1065,6 +1256,7 @@ const server = http.createServer((req, res) => {
         email: cleanEmail,
         passwordHash: hash,
         salt,
+        passwordIterations: iterations,
         avatar: `https://api.dicebear.com/7.x/bottts/svg?seed=${cleanUsername}`,
         bio: 'Ready to play! 🎮',
         status: 'online',
@@ -1083,14 +1275,16 @@ const server = http.createServer((req, res) => {
       });
 
       saveDbSync();
-      sendJson(201, { user: sanitizeUser(newUser), token });
+      setSessionCookie(token);
+      sendJson(201, { user: sanitizeUser(newUser) });
     });
     return;
   }
 
   // 2. AUTH: LOGIN
   if (req.method === 'POST' && pathname === '/api/auth/login') {
-    parseJsonBody((err, body) => {
+    if (rateLimitExceeded(req, 'login', 20)) return sendJson(429, { error: 'Too many login attempts. Try again later.' });
+    parseJsonBody(async (err, body) => {
       if (err) return sendJson(400, { error: 'Invalid JSON' });
       const { login, password } = body;
 
@@ -1101,8 +1295,15 @@ const server = http.createServer((req, res) => {
       const cleanLogin = login.trim().toLowerCase();
       const user = db.users.find(u => u.username === cleanLogin || u.email === cleanLogin);
 
-      if (!user || !verifyPassword(password, user.passwordHash, user.salt)) {
+      if (!user || !(await verifyPassword(password, user))) {
         return sendJson(401, { error: 'Invalid username/email or password.' });
+      }
+
+      if (!user.passwordIterations || user.passwordIterations < PASSWORD_ITERATIONS) {
+        const upgraded = await hashPassword(password);
+        user.passwordHash = upgraded.hash;
+        user.salt = upgraded.salt;
+        user.passwordIterations = upgraded.iterations;
       }
 
       user.status = 'online';
@@ -1115,14 +1316,19 @@ const server = http.createServer((req, res) => {
       });
 
       saveDbSync();
-      sendJson(200, { user: sanitizeUser(user), token });
+      setSessionCookie(token);
+      sendJson(200, { user: sanitizeUser(user) });
     });
     return;
   }
 
   // 2a. AUTH: FORGOT PASSWORD
   if (req.method === 'POST' && pathname === '/api/auth/forgot-password') {
-    parseJsonBody((err, body) => {
+    if (rateLimitExceeded(req, 'password-reset', 5)) return sendJson(429, { error: 'Too many reset attempts. Try again later.' });
+    if (!ALLOW_INSECURE_DEV_AUTH) {
+      return sendJson(501, { error: 'Password reset email delivery is not configured.' });
+    }
+    parseJsonBody(async (err, body) => {
       if (err) return sendJson(400, { error: 'Invalid JSON' });
       const { email } = body;
       if (!email) return sendJson(400, { error: 'Email address is required.' });
@@ -1153,15 +1359,15 @@ const server = http.createServer((req, res) => {
 
   // 2b. AUTH: RESET PASSWORD
   if (req.method === 'POST' && pathname === '/api/auth/reset-password') {
-    parseJsonBody((err, body) => {
+    parseJsonBody(async (err, body) => {
       if (err) return sendJson(400, { error: 'Invalid JSON' });
       const { email, resetToken, newPassword } = body;
       if (!email || !resetToken || !newPassword) {
         return sendJson(400, { error: 'Email, reset code, and new password are required.' });
       }
 
-      if (newPassword.length < 6) {
-        return sendJson(400, { error: 'Password must be at least 6 characters.' });
+      if (newPassword.length < 8 || newPassword.length > 128) {
+        return sendJson(400, { error: 'Password must be 8–128 characters.' });
       }
 
       const cleanEmail = email.trim().toLowerCase();
@@ -1170,9 +1376,10 @@ const server = http.createServer((req, res) => {
         return sendJson(400, { error: 'Invalid or expired reset code.' });
       }
 
-      const { hash, salt } = hashPassword(newPassword);
+      const { hash, salt, iterations } = await hashPassword(newPassword);
       user.passwordHash = hash;
       user.salt = salt;
+      user.passwordIterations = iterations;
       delete user.resetToken;
       delete user.resetTokenExpires;
 
@@ -1188,13 +1395,18 @@ const server = http.createServer((req, res) => {
       });
 
       saveDbSync();
-      sendJson(200, { success: true, user: sanitizeUser(user), token, message: 'Password updated successfully!' });
+      setSessionCookie(token);
+      sendJson(200, { success: true, user: sanitizeUser(user), message: 'Password updated successfully!' });
     });
     return;
   }
 
   // 2c. AUTH: GOOGLE ONE-CLICK SIGN IN (NO PASSWORD REQUIRED)
   if (req.method === 'POST' && pathname === '/api/auth/google') {
+    if (rateLimitExceeded(req, 'dev-auth', 20)) return sendJson(429, { error: 'Too many authentication attempts. Try again later.' });
+    if (!ALLOW_INSECURE_DEV_AUTH) {
+      return sendJson(404, { error: 'Development authentication is disabled.' });
+    }
     parseJsonBody((err, body) => {
       if (err) return sendJson(400, { error: 'Invalid JSON' });
       const { email, displayName, avatar, googleId } = body;
@@ -1247,6 +1459,7 @@ const server = http.createServer((req, res) => {
       });
 
       saveDbSync();
+      setSessionCookie(token);
       sendJson(200, { user: sanitizeUser(user), token });
     });
     return;
@@ -1264,6 +1477,7 @@ const server = http.createServer((req, res) => {
       }
       saveDbSync();
     }
+    setSessionCookie('', 0);
     sendJson(200, { success: true });
     return;
   }
@@ -1302,13 +1516,14 @@ const server = http.createServer((req, res) => {
   // 6. SOCIAL: SEARCH & LOUNGE USERS
   if (req.method === 'GET' && (pathname === '/api/users/search' || pathname === '/api/users/lounge')) {
     const authUser = getAuthUser(req);
+    if (!authUser) return sendJson(401, { error: 'Not authenticated' });
     const q = (parsedUrl.searchParams.get('q') || '').trim().toLowerCase();
 
-    let results = db.users.filter(u => !authUser || u.id !== authUser.id);
+    let results = db.users.filter(u => u.id !== authUser.id);
     if (q) {
       results = results.filter(u => u.username.includes(q) || u.displayName.toLowerCase().includes(q));
     }
-    results = results.slice(0, 15).map(sanitizeUser);
+    results = results.slice(0, 15).map(sanitizePublicUser);
 
     sendJson(200, { users: results });
     return;
@@ -1324,14 +1539,14 @@ const server = http.createServer((req, res) => {
       .filter(f => f.user1Id === authUser.id || f.user2Id === authUser.id)
       .map(f => f.user1Id === authUser.id ? f.user2Id : f.user1Id);
 
-    const friends = db.users.filter(u => friendIds.includes(u.id)).map(sanitizeUser);
+    const friends = db.users.filter(u => friendIds.includes(u.id)).map(sanitizePublicUser);
 
     // Find pending requests received
     const pendingReceived = db.friendRequests
       .filter(r => r.toUserId === authUser.id && r.status === 'pending')
       .map(r => {
         const fromUser = db.users.find(u => u.id === r.fromUserId);
-        return { id: r.id, user: fromUser ? sanitizeUser(fromUser) : null };
+        return { id: r.id, user: fromUser ? sanitizePublicUser(fromUser) : null };
       })
       .filter(r => r.user !== null);
 
@@ -1340,7 +1555,7 @@ const server = http.createServer((req, res) => {
       .filter(r => r.fromUserId === authUser.id && r.status === 'pending')
       .map(r => {
         const toUser = db.users.find(u => u.id === r.toUserId);
-        return { id: r.id, user: toUser ? sanitizeUser(toUser) : null };
+        return { id: r.id, user: toUser ? sanitizePublicUser(toUser) : null };
       })
       .filter(r => r.user !== null);
 
@@ -1355,6 +1570,7 @@ const server = http.createServer((req, res) => {
     parseJsonBody((err, body) => {
       if (err) return sendJson(400, { error: 'Invalid JSON' });
       const { targetUsername } = body;
+      if (!targetUsername || typeof targetUsername !== 'string') return sendJson(400, { error: 'A username is required.' });
       const targetUser = db.users.find(u => u.username === targetUsername.trim().toLowerCase());
 
       if (!targetUser) return sendJson(404, { error: 'User not found.' });
@@ -1382,7 +1598,7 @@ const server = http.createServer((req, res) => {
       db.friendRequests.push(newReq);
       saveDbSync();
 
-      sendToUser(targetUser.id, 'friend_request', { id: newReq.id, fromUser: sanitizeUser(authUser) });
+      sendToUser(targetUser.id, 'friend_request', { id: newReq.id, fromUser: sanitizePublicUser(authUser) });
       sendJson(200, { success: true, message: 'Friend request sent!' });
     });
     return;
@@ -1407,9 +1623,9 @@ const server = http.createServer((req, res) => {
         });
         db.friendRequests.splice(reqIdx, 1);
         saveDbSync();
-        sendToUser(fr.fromUserId, 'friend_accepted', { user: sanitizeUser(authUser) });
+        sendToUser(fr.fromUserId, 'friend_accepted', { user: sanitizePublicUser(authUser) });
         const fromUserObj = db.users.find(u => u.id === fr.fromUserId);
-        sendToUser(authUser.id, 'friend_accepted', { user: fromUserObj ? sanitizeUser(fromUserObj) : null });
+        sendToUser(authUser.id, 'friend_accepted', { user: fromUserObj ? sanitizePublicUser(fromUserObj) : null });
         sendJson(200, { success: true, message: 'Friend accepted!' });
       } else {
         db.friendRequests.splice(reqIdx, 1);
@@ -1501,8 +1717,11 @@ const server = http.createServer((req, res) => {
 
   // 9. MESSAGES
   if (req.method === 'GET' && pathname.startsWith('/api/channels/') && pathname.endsWith('/messages')) {
+    const authUser = getAuthUser(req);
+    if (!authUser) return sendJson(401, { error: 'Not authenticated' });
     const parts = pathname.split('/');
     const channelId = parts[3];
+    if (!userCanAccessChannel(authUser.id, channelId)) return sendJson(403, { error: 'You cannot access that channel.' });
     const msgs = db.messages.filter(m => m.channelId === channelId).slice(-100);
     sendJson(200, { messages: msgs });
     return;
@@ -1510,7 +1729,9 @@ const server = http.createServer((req, res) => {
 
   // 10. MULTIPLAYER GAME ROOMS
   if (req.method === 'GET' && pathname === '/api/games/rooms') {
-    sendJson(200, { rooms: db.gameRooms });
+    const authUser = getAuthUser(req);
+    if (!authUser) return sendJson(401, { error: 'Not authenticated' });
+    sendJson(200, { rooms: db.gameRooms.map(room => gameRoomForUser(room, authUser.id)) });
     return;
   }
 
@@ -1520,15 +1741,18 @@ const server = http.createServer((req, res) => {
 
     parseJsonBody((err, body) => {
       const { gameType, name, maxPlayers = 2 } = body;
+      const supportedGames = ['tictactoe', 'connect4', 'rps', 'reaction', 'guess', 'trivia'];
+      if (!supportedGames.includes(gameType)) return sendJson(400, { error: 'Unsupported game type.' });
+      const safeMaxPlayers = Math.max(2, Math.min(8, Number(maxPlayers) || 2));
       const code = crypto.randomBytes(3).toString('hex').toUpperCase();
 
       const newRoom = {
         id: 'gm-' + Date.now(),
         code,
         gameType,
-        name: name || `${authUser.displayName}'s ${gameType.toUpperCase()}`,
+        name: typeof name === 'string' && name.trim() ? name.trim().slice(0, 60) : `${authUser.displayName}'s ${gameType.toUpperCase()}`,
         hostId: authUser.id,
-        maxPlayers,
+        maxPlayers: safeMaxPlayers,
         players: [{
           userId: authUser.id,
           username: authUser.username,
@@ -1546,8 +1770,8 @@ const server = http.createServer((req, res) => {
 
       db.gameRooms.push(newRoom);
       saveDbSync();
-      broadcast('game_room_created', newRoom);
-      sendJson(201, { room: newRoom });
+      broadcastGameRoom('game_room_created', newRoom);
+      sendJson(201, { room: gameRoomForUser(newRoom, authUser.id) });
     });
     return;
   }
@@ -1558,6 +1782,7 @@ const server = http.createServer((req, res) => {
 
     parseJsonBody((err, body) => {
       const { code } = body;
+      if (!code || typeof code !== 'string') return sendJson(400, { error: 'Game room code is required.' });
       const room = db.gameRooms.find(r => r.code === code.trim().toUpperCase());
       if (!room) return sendJson(404, { error: 'Game room not found.' });
 
@@ -1575,23 +1800,28 @@ const server = http.createServer((req, res) => {
           score: 0
         });
         saveDbSync();
-        broadcast('game_room_update', room);
+        broadcastGameRoom('game_room_update', room);
       }
 
-      sendJson(200, { room });
+      sendJson(200, { room: gameRoomForUser(room, authUser.id) });
     });
     return;
   }
 
   // 11. VOICE ROOM PARTICIPANTS
   if (req.method === 'GET' && pathname.startsWith('/api/voice/')) {
+    const authUser = getAuthUser(req);
+    if (!authUser) return sendJson(401, { error: 'Not authenticated' });
     const channelId = pathname.replace('/api/voice/', '');
+    if (!userCanJoinVoiceChannel(authUser.id, channelId)) return sendJson(403, { error: 'You cannot access that voice channel.' });
     sendJson(200, { participants: db.voiceParticipants[channelId] || [] });
     return;
   }
 
   // 11b. SHARED SYNCHRONIZED MUSIC ROOMS
   if (req.method === 'GET' && pathname === '/api/music/rooms') {
+    const authUser = getAuthUser(req);
+    if (!authUser) return sendJson(401, { error: 'Not authenticated' });
     if (!db.musicRooms || db.musicRooms.length === 0) {
       db.musicRooms = getInitialDb().musicRooms;
       saveDbSync();
@@ -1612,7 +1842,11 @@ const server = http.createServer((req, res) => {
     reqPath = '/index.html';
   }
 
-  const filePath = path.join(PUBLIC_DIR, reqPath);
+  const filePath = path.resolve(PUBLIC_DIR, '.' + reqPath);
+  if (filePath !== PUBLIC_DIR && !filePath.startsWith(PUBLIC_DIR + path.sep)) {
+    sendJson(403, { error: 'Forbidden' });
+    return;
+  }
   const extname = String(path.extname(filePath)).toLowerCase();
   const MIME_TYPES = {
     '.html': 'text/html',
@@ -1622,22 +1856,19 @@ const server = http.createServer((req, res) => {
     '.png': 'image/png',
     '.jpg': 'image/jpeg',
     '.svg': 'image/svg+xml',
-    '.ico': 'image/x-icon'
+    '.ico': 'image/x-icon',
+    '.webp': 'image/webp',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2',
+    '.map': 'application/json'
   };
   const contentType = MIME_TYPES[extname] || 'application/octet-stream';
 
   fs.readFile(filePath, (error, content) => {
     if (error) {
       if (error.code === 'ENOENT') {
-        fs.readFile(path.join(PUBLIC_DIR, 'index.html'), (err2, content2) => {
-          if (err2) {
-            res.writeHead(500);
-            res.end('Server Error');
-          } else {
-            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-            res.end(content2, 'utf-8');
-          }
-        });
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Not Found');
       } else {
         res.writeHead(500);
         res.end('Server Error');
@@ -1678,4 +1909,14 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`📡 WebSocket:          ws://${localIp}:${PORT}`);
   console.log(`🔒 Database:           data/db.json (Fully persistent)`);
   console.log(`================================================================`);
+});
+
+server.on('error', (error) => {
+  if (error.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. Stop the other process or set PORT to another value.`);
+    process.exitCode = 1;
+    return;
+  }
+  console.error('Server failed:', error);
+  process.exitCode = 1;
 });
